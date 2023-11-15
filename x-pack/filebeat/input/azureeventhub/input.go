@@ -1,9 +1,3 @@
-// Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
-// or more contributor license agreements. Licensed under the Elastic License;
-// you may not use this file except in compliance with the Elastic License.
-
-//go:build !aix
-
 package azureeventhub
 
 import (
@@ -13,14 +7,11 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	eventhub "github.com/Azure/azure-event-hubs-go/v3"
-	"github.com/Azure/azure-event-hubs-go/v3/eph"
-	"github.com/mitchellh/hashstructure"
-
 	"github.com/elastic/beats/v7/filebeat/channel"
 	"github.com/elastic/beats/v7/filebeat/input"
 	"github.com/elastic/beats/v7/libbeat/beat"
+	"github.com/mitchellh/hashstructure"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs"
 	conf "github.com/elastic/elastic-agent-libs/config"
 	"github.com/elastic/elastic-agent-libs/logp"
 	"github.com/elastic/elastic-agent-libs/mapstr"
@@ -76,9 +67,11 @@ type azureInput struct {
 	workerCtx    context.Context         // worker goroutine context. It's cancelled when the input stops or the worker exits.
 	workerCancel context.CancelFunc      // used to signal that the worker should stop.
 	workerOnce   sync.Once               // guarantees that the worker goroutine is only started once.
-	processor    *eph.EventProcessorHost // eph will be assigned if users have enabled the option
+	// processor    *eph.EventProcessorHost // eph will be assigned if users have enabled the option
 	id           string                  // ID of the input; used to identify the input in the input metrics registry only, and will be removed once the input is migrated to v2.
 	metrics      *inputMetrics           // Metrics for the input.
+	consumerClient *azeventhubs.ConsumerClient
+	processorCancel context.CancelFunc   // used to signal that the processor should stop.
 }
 
 // NewInput creates a new azure-eventhub input
@@ -147,69 +140,78 @@ func (a *azureInput) Run() {
 	// invocation.
 	a.workerOnce.Do(func() {
 		a.log.Infof("%s input worker is starting.", inputName)
+		
+		a.log.Infof("%s input worker has started.", inputName)
 
 		// We set up the metrics in the `Run()` method and tear them down
 		// in the `Stop()` method.
-		//
+		
 		// The factory method `NewInput` is not a viable solution because
 		// the Runner invokes it during the configuration check without
 		// calling the `Stop()` function; this causes panics
 		// due to multiple metrics registrations.
 		a.metrics = newInputMetrics(a.id, nil)
 
-		err := a.runWithEPH()
+		a.log.Infof("Starting a.runWithProcessor")
+
+		err := a.runWithProcessor()
+
 		if err != nil {
 			a.log.Errorw("error starting the input worker", "error", err)
 			return
 		}
-		a.log.Infof("%s input worker has started.", inputName)
 	})
-}
-
-// Stop stops `azure-eventhub` input.
-func (a *azureInput) Stop() {
-	a.log.Infof("%s input worker is stopping.", inputName)
-	if a.processor != nil {
-		// Tells the processor to stop processing events and release all
-		// resources (like scheduler, leaser, checkpointer, and client).
-		err := a.processor.Close(context.Background())
-		if err != nil {
-			a.log.Errorw("error while closing eventhostprocessor", "error", err)
-		}
-	}
-
-	if a.metrics != nil {
-		a.metrics.Close()
-	}
-
-	a.workerCancel()
-	a.log.Infof("%s input worker has stopped.", inputName)
 }
 
 // Wait stop the current server
 func (a *azureInput) Wait() {
-	a.Stop()
+	if a.processorCancel != nil {
+        a.processorCancel()
+    }
 }
 
-func (a *azureInput) processEvents(event *eventhub.Event, partitionID string) bool {
+func (a *azureInput) Stop() {
+    if a.processorCancel != nil {
+        a.processorCancel()
+    }
+}
+
+func (a *azureInput) processEvents(event *azeventhubs.ReceivedEventData) bool {
 	processingStartTime := time.Now()
+ 
+	var partitionKeyVal interface{} // Declare as interface{} to hold any type
+
+	if event.PartitionKey != nil {
+		partitionKeyVal = *event.PartitionKey // Only dereference if not nil
+	} else {
+		partitionKeyVal = nil // Explicitly set to nil
+	}
+	
 	azure := mapstr.M{
-		// partitionID is only mapped in the non-eph option which is not available yet, this field will be temporary unavailable
-		//"partition_id":   partitionID,
+		// "partition_id":   partitionID,
 		"eventhub":       a.config.EventHubName,
 		"consumer_group": a.config.ConsumerGroup,
+		"partition_key":  partitionKeyVal, // Now safe to assign
 	}
 
 	// update the input metrics
 	a.metrics.receivedMessages.Inc()
-	a.metrics.receivedBytes.Add(uint64(len(event.Data)))
+	a.metrics.receivedBytes.Add(uint64(len(event.Body)))
 
-	records := a.parseMultipleRecords(event.Data)
+	records := a.parseMultipleRecords(event.Body)
 
 	for _, record := range records {
-		_, _ = azure.Put("offset", event.SystemProperties.Offset)
-		_, _ = azure.Put("sequence_number", event.SystemProperties.SequenceNumber)
-		_, _ = azure.Put("enqueued_time", event.SystemProperties.EnqueuedTime)
+		var partitionKeyVal interface{} // Declare as interface{} to hold any type
+
+		if event.PartitionKey != nil {
+			partitionKeyVal = *event.PartitionKey // Only dereference if not nil
+		} else {
+			partitionKeyVal = nil // Explicitly set to nil
+		}
+		_, _ = azure.Put("offset", event.Offset)
+		_, _ = azure.Put("sequence_number", event.SequenceNumber)
+		_, _ = azure.Put("enqueued_time", event.EnqueuedTime)
+		_, _ = azure.Put("partition_key", partitionKeyVal)
 		ok := a.outlet.OnEvent(beat.Event{
 			// this is the default value for the @timestamp field; usually the ingest
 			// pipeline replaces it with a value in the payload.
@@ -218,7 +220,7 @@ func (a *azureInput) processEvents(event *eventhub.Event, partitionID string) bo
 				"message": record,
 				"azure":   azure,
 			},
-			Private: event.Data,
+			Private: event.Body,
 		})
 		if !ok {
 			a.metrics.processingTime.Update(time.Since(processingStartTime).Nanoseconds())
