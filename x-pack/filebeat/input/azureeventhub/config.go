@@ -20,9 +20,11 @@ type azureInputConfig struct {
 	EventHubName     string `config:"eventhub" validate:"required"`
 	ConsumerGroup    string `config:"consumer_group"`
 	// Azure Storage container to store leases and checkpoints
-	SAName      string `config:"storage_account"`
-	SAKey       string `config:"storage_account_key"`
-	SAContainer string `config:"storage_account_container"`
+	SAName      	 	string `config:"storage_account"`
+	SAKey       		string `config:"storage_account_key"`
+	SAConnectionString	string `config:"storage_account_connection_string"`	
+	SAContainer 		string `config:"storage_account_container"`
+	SAEndpoint  		string `config:"storage_account_endpoint"`
 	// by default the azure public environment is used, to override, users can provide a specific resource manager endpoint
 	OverrideEnvironment string `config:"resource_manager_endpoint"`
 	// cleanup the log JSON input for known issues, options: SINGLE_QUOTES, NEW_LINES

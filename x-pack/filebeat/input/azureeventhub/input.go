@@ -1,3 +1,9 @@
+// Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+// or more contributor license agreements. Licensed under the Elastic License;
+// you may not use this file except in compliance with the Elastic License.
+
+//go:build !aix
+
 package azureeventhub
 
 import (
@@ -67,7 +73,6 @@ type azureInput struct {
 	workerCtx    context.Context         // worker goroutine context. It's cancelled when the input stops or the worker exits.
 	workerCancel context.CancelFunc      // used to signal that the worker should stop.
 	workerOnce   sync.Once               // guarantees that the worker goroutine is only started once.
-	// processor    *eph.EventProcessorHost // eph will be assigned if users have enabled the option
 	id           string                  // ID of the input; used to identify the input in the input metrics registry only, and will be removed once the input is migrated to v2.
 	metrics      *inputMetrics           // Metrics for the input.
 	consumerClient *azeventhubs.ConsumerClient
@@ -140,40 +145,45 @@ func (a *azureInput) Run() {
 	// invocation.
 	a.workerOnce.Do(func() {
 		a.log.Infof("%s input worker is starting.", inputName)
-		
-		a.log.Infof("%s input worker has started.", inputName)
 
 		// We set up the metrics in the `Run()` method and tear them down
 		// in the `Stop()` method.
-		
+		//
 		// The factory method `NewInput` is not a viable solution because
 		// the Runner invokes it during the configuration check without
 		// calling the `Stop()` function; this causes panics
 		// due to multiple metrics registrations.
 		a.metrics = newInputMetrics(a.id, nil)
 
-		a.log.Infof("Starting a.runWithProcessor")
-
 		err := a.runWithProcessor()
-
 		if err != nil {
 			a.log.Errorw("error starting the input worker", "error", err)
 			return
 		}
+		a.log.Infof("%s input worker has started.", inputName)
 	})
+}
+
+// Stop stops `azure-eventhub` input.
+func (a *azureInput) Stop() {
+	a.log.Infof("%s input worker is stopping.", inputName)
+	
+	// Replaces the processor Close call with processorCancel.
+	if a.processorCancel != nil {
+		a.processorCancel()
+	}
+
+	if a.metrics != nil {
+		a.metrics.Close()
+	}
+
+	a.workerCancel()
+	a.log.Infof("%s input worker has stopped.", inputName)
 }
 
 // Wait stop the current server
 func (a *azureInput) Wait() {
-	if a.processorCancel != nil {
-        a.processorCancel()
-    }
-}
-
-func (a *azureInput) Stop() {
-    if a.processorCancel != nil {
-        a.processorCancel()
-    }
+	a.Stop()
 }
 
 func (a *azureInput) processEvents(event *azeventhubs.ReceivedEventData) bool {
@@ -188,7 +198,6 @@ func (a *azureInput) processEvents(event *azeventhubs.ReceivedEventData) bool {
 	}
 	
 	azure := mapstr.M{
-		// "partition_id":   partitionID,
 		"eventhub":       a.config.EventHubName,
 		"consumer_group": a.config.ConsumerGroup,
 		"partition_key":  partitionKeyVal, // Now safe to assign
@@ -201,13 +210,6 @@ func (a *azureInput) processEvents(event *azeventhubs.ReceivedEventData) bool {
 	records := a.parseMultipleRecords(event.Body)
 
 	for _, record := range records {
-		var partitionKeyVal interface{} // Declare as interface{} to hold any type
-
-		if event.PartitionKey != nil {
-			partitionKeyVal = *event.PartitionKey // Only dereference if not nil
-		} else {
-			partitionKeyVal = nil // Explicitly set to nil
-		}
 		_, _ = azure.Put("offset", event.Offset)
 		_, _ = azure.Put("sequence_number", event.SequenceNumber)
 		_, _ = azure.Put("enqueued_time", event.EnqueuedTime)

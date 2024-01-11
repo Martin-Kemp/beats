@@ -15,7 +15,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
-	// "github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs/checkpoints"
 )
 
@@ -33,15 +32,18 @@ func (a *azureInput) runWithProcessor() error {
 	// if err != nil {
 	// 	return err
 	// }
-	url := "msbbeatsoffset.blob.core.windows.net"
+
+	// TODO: Get URL from config
+	// url := "msbbeatsoffset.blob.core.windows.net"
 	
 	// Load credentials from config
 	eventHubConnectionString := a.config.ConnectionString
 	eventHubName := a.config.EventHubName
-	storageConnectionString := a.config.SAKey
+	storageConnectionString := a.config.SAConnectionString
 	storageContainerName := a.config.SAContainer
+	storageEndpoint := a.config.SAEndpoint
 
-	consumerClient, checkpointStore, err := createClients(url, eventHubConnectionString, eventHubName, storageConnectionString, storageContainerName)
+	consumerClient, checkpointStore, err := createClients(storageEndpoint, eventHubConnectionString, eventHubName, storageConnectionString, storageContainerName)
 
 	if err != nil {
 		panic(err)
@@ -91,8 +93,6 @@ func createClients(url, eventHubConnectionString, eventHubName, storageConnectio
 	// 	return nil, nil, err
 	// }
 
-	// TODO: Support both shared key and SAS token authentication
-	// azBlobContainerClient, err := container.NewClientWithSharedKeyCredential(url, cred, nil)
 	azBlobContainerClient, err := container.NewClientFromConnectionString(storageConnectionString, storageContainerName, nil)
 
 	if err != nil {
